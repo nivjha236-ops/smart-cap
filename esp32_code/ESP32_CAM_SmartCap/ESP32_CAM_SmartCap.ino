@@ -1,39 +1,32 @@
 /*
  =========================================================================================
-   SMART CAP - ESP32-CAM AI CLIENT (CONNECTS TO RENDER CLOUD)
+   SMART CAP - ESP32-CAM AI CLIENT (ZERO LOCAL IP CONFIGURATION)
    GP Siwan / Bihar Talent Hunt
  =========================================================================================
    Description:
-   Yeh sketch ESP32-CAM par flash hoga. Yeh camera se photo lega aur Render Server par
-   bheje ga (HTTPS POST). Render Server AI se detect karke alert wapas bhejega.
-   Jaise hi alert aayega, ESP32-CAM turant aapke Main ESP32 (10.26.35.113) ko trigger karega!
+   Yeh sketch ESP32-CAM par flash hoga. Yeh camera se photo lega aur direct Render Server
+   par bhejega (HTTPS POST). 
 
    Faayda:
-   1. Laptop ko sath lekar ghumne ki zaroorat nahi hai.
-   2. Mobile Hotspot on karte hi yeh internet se connect hokar kaam karne lagega!
-   3. Main ESP32 me koi change nahi karna padega!
+   1. Kisi bhi local IP address (10.x.x.x ya 192.168.x.x) ki zaroorat nahi hai!
+   2. Hotspot badal jaye ya IP badal jaye, isko koi farak nahi padega.
+   3. Sirf Render Cloud Domain (smartcap-ai.onrender.com) se connect hota hai.
  =========================================================================================
 */
 
 #include "esp_camera.h"
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
-#include <HTTPClient.h>
 
 // ==================== 1. WI-FI CREDENTIALS ====================
-// Apne Mobile Hotspot ka Naam aur Password yahan daalein:
+// Apne Mobile Hotspot ka Naam aur Password daalein:
 const char* ssid     = "YOUR_HOTSPOT_NAME";
 const char* password = "YOUR_HOTSPOT_PASSWORD";
 
-// ==================== 2. RENDER SERVER URL ====================
-// Render par deploy karne ke baad jo URL milega, uska domain name yahan daalein:
-// (Bina "https://" aur bina aakhiri slash "/" ke):
+// ==================== 2. RENDER CLOUD SERVER ====================
+// Aapka Render domain (bina "https://" aur bina "/" ke):
 const char* RENDER_HOST = "smartcap-ai.onrender.com"; 
 const int   RENDER_PORT = 443; // HTTPS Port
-
-// ==================== 3. MAIN ESP32 IP ====================
-// DFPlayer wale Main ESP32 ka local IP (Hotspot se jo IP milta hai):
-const char* MAIN_ESP32_IP = "10.26.35.113";
 // ==============================================================
 
 // CAMERA PIN CONFIGURATION (AI THINKER MODEL)
@@ -79,10 +72,10 @@ void setupCamera() {
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
 
-  // Frame size: QVGA (320x240) ya CIF (400x296) for super fast 4G upload
+  // Frame size: QVGA (320x240) - fast upload over mobile data
   if (psramFound()) {
-    config.frame_size = FRAMESIZE_QVGA; // 320x240 (Fast upload over 4G)
-    config.jpeg_quality = 12;          // 10-15 best balance
+    config.frame_size = FRAMESIZE_QVGA;
+    config.jpeg_quality = 12;
     config.fb_count = 2;
   } else {
     config.frame_size = FRAMESIZE_QVGA;
@@ -101,13 +94,14 @@ void setupCamera() {
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  Serial.println("\n======================================");
-  Serial.println("  SMART CAP - ESP32-CAM CLOUD CLIENT  ");
-  Serial.println("======================================");
+  Serial.println("\n==============================================");
+  Serial.println("  SMART CAP - ESP32-CAM CLOUD UPLOADER        ");
+  Serial.println("  (100% Zero Local IP - Direct to Render)     ");
+  Serial.println("==============================================");
 
   setupCamera();
 
-  // Connect to Mobile Hotspot Wi-Fi
+  // Connect to Wi-Fi
   Serial.printf("Connecting to Wi-Fi: %s", ssid);
   WiFi.begin(ssid, password);
   while (WiFi.status() != WL_CONNECTED) {
@@ -118,32 +112,8 @@ void setup() {
   Serial.print("ESP32-CAM IP: ");
   Serial.println(WiFi.localIP());
 
-  // Allow HTTPS without checking SSL certificate (Fast & lightweight)
-  secureClient.setInsecure();
-  secureClient.setTimeout(5); // 5 seconds timeout
-}
-
-void sendAlertToMaster(String alertEndpoint) {
-  if (alertEndpoint.length() == 0) return;
-
-  Serial.println("🔊 Triggering Main ESP32 locally: " + alertEndpoint);
-
-  // Send local HTTP request to Main ESP32
-  HTTPClient localClient;
-  String fullUrl = "http://" + String(MAIN_ESP32_IP) + "/" + alertEndpoint;
-  localClient.begin(fullUrl);
-  localClient.setTimeout(1500);
-  int httpCode = localClient.GET();
-  if (httpCode > 0) {
-    Serial.printf("✅ Main ESP32 Responded: %d\n", httpCode);
-  } else {
-    Serial.printf("⚠️ Main ESP32 Error: %s\n", localClient.errorToString(httpCode).c_str());
-  }
-  localClient.end();
-
-  // Also print to Serial (agar TX pin Main ESP32 ke RX se judi ho to Serial se bhi mil jayega)
-  Serial.print("ALERT_TRIGGER:");
-  Serial.println(alertEndpoint);
+  secureClient.setInsecure(); // No certificate check needed
+  secureClient.setTimeout(5);
 }
 
 void loop() {
@@ -172,41 +142,28 @@ void loop() {
     secureClient.println("Connection: close");
     secureClient.println();
 
-    // Send binary bytes
+    // Stream binary image bytes
     secureClient.write(fb->buf, fb->len);
 
-    // 4. Read response
-    String response = "";
-    long timeout = millis() + 5000;
+    Serial.printf("📸 [FRAME SENT] %d bytes uploaded to Render!\n", fb->len);
+
+    // Read response briefly
+    long timeout = millis() + 4000;
     while (secureClient.connected() && millis() < timeout) {
       while (secureClient.available()) {
         char c = secureClient.read();
-        response += c;
+        // Discard response characters, server processes it in cloud
       }
     }
     secureClient.stop();
-
-    // 5. Parse JSON Alert from response
-    // Example response: {"status":"success", "alert":"hazard?type=fire", ...}
-    int alertIdx = response.indexOf("\"alert\":");
-    if (alertIdx != -1) {
-      int startQuote = response.indexOf("\"", alertIdx + 8);
-      int endQuote = response.indexOf("\"", startQuote + 1);
-      if (startQuote != -1 && endQuote != -1) {
-        String alert = response.substring(startQuote + 1, endQuote);
-        if (alert != "null" && alert.length() > 0) {
-          sendAlertToMaster(alert);
-        }
-      }
-    }
   } else {
     Serial.println("[ERROR] Failed to connect to Render Host!");
     delay(1000);
   }
 
-  // Return the frame buffer to free memory
+  // Free frame buffer
   esp_camera_fb_return(fb);
 
-  // Interval between frames (500ms - 800ms)
-  delay(500);
+  // Interval between captures (400ms - 600ms)
+  delay(400);
 }

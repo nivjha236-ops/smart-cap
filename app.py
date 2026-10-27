@@ -317,6 +317,72 @@ def detect():
 def get_latest_alert():
     return jsonify(last_alert)
 
+@app.route('/api/poll-alert', methods=['GET'])
+def poll_alert():
+    """
+    JSON polling endpoint for Main ESP32 or client apps.
+    Pass ?last_id=X to only get new alerts.
+    """
+    last_id = request.args.get('last_id', default=0, type=int)
+    has_new = (last_alert["alert_id"] > last_id) and (time.time() - last_alert.get("timestamp", 0) < 10.0)
+    return jsonify({
+        "has_new": has_new,
+        "alert_id": last_alert.get("alert_id", 0),
+        "endpoint": last_alert.get("endpoint", "") if has_new else "",
+        "alert_type": last_alert.get("type", "") if has_new else "",
+        "message": last_alert.get("message", "") if has_new else "",
+        "timestamp": last_alert.get("timestamp", 0)
+    })
+
+@app.route('/api/poll-alert-simple', methods=['GET'])
+def poll_alert_simple():
+    """
+    Ultra-lightweight plain text endpoint for Main ESP32:
+    Format if new: 'NEW:<endpoint>:<alert_id>:<message>'
+    Format if none: 'NONE:0'
+    """
+    last_id = request.args.get('last_id', default=0, type=int)
+    has_new = (last_alert["alert_id"] > last_id) and (time.time() - last_alert.get("timestamp", 0) < 10.0)
+    if has_new:
+        ep = last_alert.get("endpoint", "")
+        aid = last_alert.get("alert_id", 0)
+        msg = last_alert.get("message", "")
+        return f"NEW:{ep}:{aid}:{msg}", 200, {'Content-Type': 'text/plain'}
+    return "NONE:0", 200, {'Content-Type': 'text/plain'}
+
+@app.route('/api/trigger-test', methods=['GET', 'POST'])
+def trigger_test():
+    """
+    Manual trigger test endpoint: allows user to test voice from browser.
+    Usage: /api/trigger-test?type=person
+    """
+    global last_trigger_time, last_alert, alert_counter
+    t = request.args.get('type', default='person')
+    ep_map = {
+        'person': ('person?name=unknown', 'unknown_person', 'Koi Vyakti Samne Hai!'),
+        'shridev': ('person?name=shridev', 'shridev', 'Shridev Bhaiya Samne Hain!'),
+        'dog': ('animal?type=dog', 'dog', 'Kutta (Dog) Samne Hai!'),
+        'cow': ('animal?type=cow', 'cow', 'Janwar (Cow) Samne Hai!'),
+        'car': ('hazard?type=car', 'car', 'Gadi (Car) Samne Hai!'),
+        'bike': ('hazard?type=bike', 'bike', 'Bike Samne Hai!'),
+        'fire': ('hazard?type=fire', 'fire', 'Aag (Fire) Samne Hai!'),
+        'pole': ('hazard?type=pole', 'pole', 'Kamba / Rukawat Samne Hai!')
+    }
+    ep, atype, amsg = ep_map.get(t, ep_map['person'])
+    now = time.time()
+    last_trigger_time = now
+    alert_counter += 1
+    last_alert = {
+        "type": atype,
+        "endpoint": ep,
+        "message": amsg,
+        "timestamp": now,
+        "alert_id": alert_counter
+    }
+    print(f"🔊 [MANUAL TEST TRIGGER #{alert_counter}] -> {ep}")
+    return jsonify({"status": "triggered", "alert": last_alert})
+
+
 # ==================== WEB DASHBOARD & STREAM ====================
 
 def gen_frames():
@@ -415,10 +481,21 @@ def dashboard():
                     </div>
                 </div>
 
-                <h2>📡 API Endpoints for ESP32</h2>
+                <h2>🔊 Instant Voice Test (Speaker Test)</h2>
+                <div style="display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 15px;">
+                    <button onclick="triggerVoiceTest('person')" style="background: #2563eb; color: white; border: none; padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 12px;">👤 Person</button>
+                    <button onclick="triggerVoiceTest('shridev')" style="background: #16a34a; color: white; border: none; padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 12px;">👑 Shridev</button>
+                    <button onclick="triggerVoiceTest('dog')" style="background: #ea580c; color: white; border: none; padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 12px;">🐕 Dog</button>
+                    <button onclick="triggerVoiceTest('car')" style="background: #0284c7; color: white; border: none; padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 12px;">🚗 Car</button>
+                    <button onclick="triggerVoiceTest('fire')" style="background: #dc2626; color: white; border: none; padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 12px;">🔥 Fire</button>
+                    <button onclick="triggerVoiceTest('pole')" style="background: #ca8a04; color: white; border: none; padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 12px;">🚧 Pole</button>
+                </div>
+
+                <h2>📡 API Endpoints for ESP32 (Zero Local IP)</h2>
                 <div style="background: #0f172a; padding: 12px; border-radius: 8px; font-size: 12px; color: #94a3b8; line-height: 1.6; border: 1px solid #334155;">
                     <div><b>ESP32-CAM Upload:</b> <code>POST /api/detect</code></div>
-                    <div><b>ESP32 Master Poll:</b> <code>GET /api/latest-alert</code></div>
+                    <div><b>Main ESP32 Poll (Text):</b> <code>GET /api/poll-alert-simple</code></div>
+                    <div><b>Main ESP32 Poll (JSON):</b> <code>GET /api/poll-alert</code></div>
                     <div><b>Web Live Stream:</b> <code>GET /stream</code></div>
                 </div>
             </div>
@@ -460,9 +537,16 @@ def dashboard():
                 method: 'POST',
                 body: formData
             });
-            const data = await res.json();
             alert("AI Result: " + JSON.stringify(data, null, 2));
             fetchStats();
+        }
+
+        async function triggerVoiceTest(type) {
+            try {
+                const res = await fetch('/api/trigger-test?type=' + type);
+                const data = await res.json();
+                fetchStats();
+            } catch(e) {}
         }
     </script>
 </body>
