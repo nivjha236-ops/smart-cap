@@ -31,15 +31,32 @@ print("="*65)
 print("[AI] Loading YOLOv8 Neural Network into OpenCV...")
 model_path = os.path.join(os.path.dirname(__file__), "yolov8n.onnx")
 net = cv2.dnn.readNet(model_path)
-net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
-net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+try:
+    if hasattr(cv2.dnn, 'DNN_BACKEND_OPENCV'):
+        net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+    if hasattr(cv2.dnn, 'DNN_TARGET_CPU'):
+        net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+except Exception:
+    pass
 print("[AI] Neural Network Loaded Successfully!")
 
-# Load Haar Face Detector
+# Load Haar Face Detector (Resilient to OpenCV 4 and 5)
+face_cascade = None
 cascade_file = os.path.join(os.path.dirname(__file__), "haarcascade_frontalface_default.xml")
-if not os.path.exists(cascade_file):
+if not os.path.exists(cascade_file) and hasattr(cv2, 'data') and hasattr(cv2.data, 'haarcascades'):
     cascade_file = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-face_cascade = cv2.CascadeClassifier(cascade_file)
+
+try:
+    if hasattr(cv2, 'CascadeClassifier'):
+        face_cascade = cv2.CascadeClassifier(cascade_file)
+        print("✅ [AI] CascadeClassifier initialized from cv2!")
+    elif hasattr(cv2, 'objdetect') and hasattr(cv2.objdetect, 'CascadeClassifier'):
+        face_cascade = cv2.objdetect.CascadeClassifier(cascade_file)
+        print("✅ [AI] CascadeClassifier initialized from cv2.objdetect!")
+    else:
+        print("⚠️ [INFO] CascadeClassifier not found in current OpenCV build. Using YOLO-based face ROI fallback.")
+except Exception as e:
+    print(f"⚠️ [WARNING] Could not load face cascade: {e}")
 
 # Load Shridev Bhaiya's Face Profile
 shridev_hist = None
@@ -49,17 +66,21 @@ try:
         ref_img = cv2.imread(shridev_path)
         if ref_img is not None:
             ref_gray = cv2.cvtColor(ref_img, cv2.COLOR_BGR2GRAY)
-            ref_faces = face_cascade.detectMultiScale(ref_gray, 1.1, 4)
-            if len(ref_faces) > 0:
-                rx, ry, rw, rh = ref_faces[0]
-                face_roi = ref_gray[ry:ry+rh, rx:rx+rw]
-                shridev_hist = cv2.calcHist([face_roi], [0], None, [256], [0, 256])
-                cv2.normalize(shridev_hist, shridev_hist, 0, 1, cv2.NORM_MINMAX)
-                print("👑 [SUCCESS] Shridev Bhaiya's Face Profile Loaded & Calibrated!")
-            else:
-                shridev_hist = cv2.calcHist([ref_gray], [0], None, [256], [0, 256])
-                cv2.normalize(shridev_hist, shridev_hist, 0, 1, cv2.NORM_MINMAX)
-                print("👑 [INFO] Full Image Profile Loaded for Shridev Bhaiya!")
+            face_roi = None
+            if face_cascade is not None:
+                ref_faces = face_cascade.detectMultiScale(ref_gray, 1.1, 4)
+                if len(ref_faces) > 0:
+                    rx, ry, rw, rh = ref_faces[0]
+                    face_roi = ref_gray[ry:ry+rh, rx:rx+rw]
+            
+            # If no cascade or face not detected, use upper-center portion as face profile
+            if face_roi is None:
+                rh, rw = ref_gray.shape
+                face_roi = ref_gray[int(rh*0.1):int(rh*0.6), int(rw*0.2):int(rw*0.8)]
+
+            shridev_hist = cv2.calcHist([face_roi], [0], None, [256], [0, 256])
+            cv2.normalize(shridev_hist, shridev_hist, 0, 1, cv2.NORM_MINMAX)
+            print("👑 [SUCCESS] Shridev Bhaiya's Profile Loaded & Calibrated!")
 except Exception as e:
     print(f"[WARNING] Could not load shridev.jpg: {e}")
 
@@ -141,6 +162,7 @@ def process_frame(frame):
     # 2. YOLO Object Detection
     detections = run_yolo_detection(small_frame)
     detected_labels = [d[0] for d in detections]
+    person_boxes = []
 
     for label, conf, box in detections:
         x, y, bw, bh = box
@@ -150,6 +172,9 @@ def process_frame(frame):
         
         cv2.rectangle(small_frame, (x, y), (x + bw, y + bh), color, 2)
         cv2.putText(small_frame, f"{label} {int(conf*100)}%", (x, max(20, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+
+        if label == 'person':
+            person_boxes.append(box)
 
         # Low Obstacle / Pole Check
         if (y + bh) > (h * 0.72) and label in ['chair', 'bench', 'fire hydrant', 'potted plant', 'traffic light']:
@@ -179,18 +204,33 @@ def process_frame(frame):
             alert_message = "Bike Samne Hai!"
         elif 'person' in detected_labels:
             gray = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
-            faces = face_cascade.detectMultiScale(gray, 1.2, 4)
             is_shridev = False
 
-            if len(faces) > 0 and shridev_hist is not None:
-                fx, fy, fw, fh = faces[0]
-                current_face = gray[fy:fy+fh, fx:fx+fw]
-                curr_hist = cv2.calcHist([current_face], [0], None, [256], [0, 256])
-                cv2.normalize(curr_hist, curr_hist, 0, 1, cv2.NORM_MINMAX)
-
-                similarity = cv2.compareHist(shridev_hist, curr_hist, cv2.HISTCMP_CORREL)
-                if similarity > 0.55:
-                    is_shridev = True
+            # Try cascade detection first if available
+            if face_cascade is not None:
+                faces = face_cascade.detectMultiScale(gray, 1.2, 4)
+                if len(faces) > 0 and shridev_hist is not None:
+                    fx, fy, fw, fh = faces[0]
+                    current_face = gray[fy:fy+fh, fx:fx+fw]
+                    curr_hist = cv2.calcHist([current_face], [0], None, [256], [0, 256])
+                    cv2.normalize(curr_hist, curr_hist, 0, 1, cv2.NORM_MINMAX)
+                    similarity = cv2.compareHist(shridev_hist, curr_hist, cv2.HISTCMP_CORREL)
+                    if similarity > 0.55:
+                        is_shridev = True
+            elif len(person_boxes) > 0 and shridev_hist is not None:
+                # Fallback: check upper 35% of person bounding box
+                px, py, pw, ph = person_boxes[0]
+                face_y1 = max(0, py)
+                face_y2 = min(h, py + int(ph * 0.35))
+                face_x1 = max(0, px)
+                face_x2 = min(w, px + pw)
+                if face_y2 > face_y1 and face_x2 > face_x1:
+                    current_face = gray[face_y1:face_y2, face_x1:face_x2]
+                    curr_hist = cv2.calcHist([current_face], [0], None, [256], [0, 256])
+                    cv2.normalize(curr_hist, curr_hist, 0, 1, cv2.NORM_MINMAX)
+                    similarity = cv2.compareHist(shridev_hist, curr_hist, cv2.HISTCMP_CORREL)
+                    if similarity > 0.55:
+                        is_shridev = True
 
             if is_shridev:
                 cv2.putText(small_frame, "SHRIDEV BHAIYA", (20, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
@@ -254,7 +294,6 @@ def detect():
     """
     frame = None
 
-    # Option 1: Multipart form upload
     if 'image' in request.files:
         file = request.files['image']
         file_bytes = np.frombuffer(file.read(), np.uint8)
@@ -263,7 +302,6 @@ def detect():
         file = request.files['frame']
         file_bytes = np.frombuffer(file.read(), np.uint8)
         frame = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-    # Option 2: Raw binary image in request body (Fastest for ESP32)
     elif request.data:
         file_bytes = np.frombuffer(request.data, np.uint8)
         frame = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
@@ -277,10 +315,6 @@ def detect():
 @app.route('/api/latest-alert', methods=['GET'])
 @app.route('/alert', methods=['GET'])
 def get_latest_alert():
-    """
-    Main ESP32 polling endpoint:
-    Returns the most recent alert so the master board can play audio.
-    """
     return jsonify(last_alert)
 
 # ==================== WEB DASHBOARD & STREAM ====================
@@ -346,7 +380,6 @@ def dashboard():
         </header>
 
         <div class="grid">
-            <!-- Left: Video Stream -->
             <div class="card">
                 <h2>📹 Live AI Stream</h2>
                 <div class="stream-box">
@@ -361,10 +394,8 @@ def dashboard():
                 </div>
             </div>
 
-            <!-- Right: Status & Alerts -->
             <div class="card">
                 <h2>⚡ Live Stats & Alerts</h2>
-                
                 <div class="stat-grid">
                     <div class="stat-item">
                         <div class="stat-val" id="statFrames">0</div>
@@ -440,7 +471,6 @@ def dashboard():
     return render_template_string(html_template)
 
 if __name__ == '__main__':
-    # Local development port
     port = int(os.environ.get("PORT", 5000))
     print(f"\n🚀 Smart Cap Cloud AI Server starting on http://localhost:{port}")
     app.run(host='0.0.0.0', port=port, debug=False)
